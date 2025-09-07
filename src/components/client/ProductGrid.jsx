@@ -20,6 +20,8 @@ const ProductGrid = ({
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [quantities, setQuantities] = useState({});
+  const [addingToCart, setAddingToCart] = useState({});
 
 
   const fetchProducts = async (categoryId) => {
@@ -43,9 +45,13 @@ const ProductGrid = ({
       console.log('API Response:', data);
 
       if (data.product && Array.isArray(data.product)) {
-              const transformedProducts = data.product.map(product => {
-        const store = product.stores && product.stores.length > 0 ? product.stores[0] : null;
-          
+        const transformedProducts = data.product.map(product => {
+          const store = product.stores && product.stores.length > 0 ? product.stores[0] : null;
+
+          const pivotId = store && store.pivot
+            ? (store.pivot.id ?? store.pivot.store_product_id ?? store.pivot.storeProductId ?? store.pivot.store_products_id ?? null)
+            : null;
+
           return {
             id: product.id,
             name: product.product_name,
@@ -59,11 +65,15 @@ const ProductGrid = ({
             availability: product.availability,
             saleStatus: store ? store.pivot.sale_status : 'unknown',
             offerDescription: store ? store.pivot.offers_Desc : '',
-            stores: product.stores || []
+            stores: product.stores || [],
+            storeProductId: pivotId,
           };
         });
-        
+
         setProducts(transformedProducts);
+        const initialQuantities = {};
+        transformedProducts.forEach(p => { initialQuantities[p.id] = 1; });
+        setQuantities(initialQuantities);
       } else {
         setProducts([]);
       }
@@ -85,29 +95,95 @@ const ProductGrid = ({
   }, [selectedCategory]);
   const getFilteredProducts = () => {
     if (selectedStore) {
-      return products.filter(
-        (product) => product.storeId === selectedStore.id,
-      );
+      return products.filter((product) => (product.stores || []).some((st) => st.id === selectedStore.id));
     }
     return products;
   };
 
   const displayProducts = getFilteredProducts();
 
-  const handleAddToCart = (product) => {
-    const success = addToCart({
-      id: product.id,
-      name: product.name,
-      price: product.price,
-      image: product.image,
-      store: product.storeName,
-      storeId: product.storeId
+  const getStoreProductId = (product) => {
+    const pickPivotId = (pivot = {}) => (
+      (pivot && (pivot.id ?? pivot.store_product_id ?? pivot.storeProductId ?? pivot.store_products_id)) || null
+    );
+
+    if (selectedStore) {
+      const s = (product.stores || []).find((st) => st.id === selectedStore.id);
+      if (s) return pickPivotId(s.pivot || {});
+    }
+    const first = (product.stores || [])[0];
+    return pickPivotId(first?.pivot || {});
+  };
+
+  const incrementQuantity = (productId) => {
+    setQuantities((prev) => ({ ...prev, [productId]: (prev[productId] ?? 1) + 1 }));
+  };
+
+  const decrementQuantity = (productId) => {
+    setQuantities((prev) => {
+      const next = Math.max(1, (prev[productId] ?? 1) - 1);
+      return { ...prev, [productId]: next };
     });
-    
-    if (success) {
-      alert(`${product.name} added to cart!`);
-    } else {
-      console.log("Failed to add item to cart");
+  };
+
+  const handleAddToCart = async (product) => {
+    const quantity = quantities[product.id] ?? 1;
+    setAddingToCart((prev) => ({ ...prev, [product.id]: true }));
+    try {
+      const token = localStorage.getItem('token');
+      if (!token) {
+        alert('Please log in to add items to your cart.');
+        return;
+      }
+
+      const productIdToUse = getStoreProductId(product);
+      if (!productIdToUse) {
+        console.warn(`Skipping product ${product.name} — missing store_product ID`, product.stores);
+        alert(`This product (${product.name}) cannot be added to cart.`);
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('quantity', String(quantity));
+
+      const response = await fetch(`http://127.0.0.1:8000/api/cart/add/${productIdToUse}`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+
+      const responseData = await response.json();
+      alert(responseData.message || `${product.name} added to cart (x${quantity})!`);
+
+      const chosenStore = selectedStore
+        ? (product.stores || []).find((st) => st.id === selectedStore.id)
+        : (product.stores || [])[0];
+      const price = chosenStore ? parseFloat(chosenStore.pivot?.price) : product.price;
+      const storeId = chosenStore ? chosenStore.id : product.storeId;
+      const storeName = chosenStore ? (chosenStore.store_name || chosenStore.name) : product.storeName;
+
+      addToCart({
+        id: product.id,
+        name: product.name,
+        price,
+        image: product.image,
+        store: storeName,
+        storeId,
+        quantity,
+      });
+    } catch (err) {
+      console.error('Error adding to cart:', err);
+      alert(`Failed to add to cart: ${err.message}`);
+    } finally {
+      setAddingToCart((prev) => ({ ...prev, [product.id]: false }));
     }
   };
 
@@ -242,21 +318,50 @@ const ProductGrid = ({
                         {product.offerDescription}
                       </p>
                     )}
-                    <div className="flex justify-between items-center">
-                      <span className="text-lg font-bold text-primary">
-                        ${product.price}
-                      </span>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleAddToCart(product);
-                        }}
-                        className="flex items-center space-x-1 px-3 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
-                      >
-                        <ShoppingCart className="h-4 w-4" />
-                        <span className="text-sm">Add</span>
-                      </button>
-                    </div>
+                    {(() => {
+                      const chosenStore = selectedStore
+                        ? (product.stores || []).find((st) => st.id === selectedStore.id)
+                        : (product.stores || [])[0];
+                      const resolvedPrice = chosenStore ? parseFloat(chosenStore.pivot?.price) : product.price;
+                      return (
+                        <div className="flex flex-col space-y-3">
+                          <span className="text-lg font-bold text-primary">${resolvedPrice}</span>
+                          <div className="flex items-center justify-between space-x-3">
+                            <div className="flex items-center border rounded-md overflow-hidden">
+                              <button
+                                onClick={(e) => { e.stopPropagation(); decrementQuantity(product.id); }}
+                                className="px-3 py-1 text-gray-700 hover:bg-gray-100"
+                                aria-label="Decrease quantity"
+                              >
+                                -
+                              </button>
+                              <div className="px-3 select-none min-w-[2ch] text-center">
+                                {quantities[product.id] ?? 1}
+                              </div>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); incrementQuantity(product.id); }}
+                                className="px-3 py-1 text-gray-700 hover:bg-gray-100"
+                                aria-label="Increase quantity"
+                              >
+                                +
+                              </button>
+                            </div>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleAddToCart(product); }}
+                              disabled={!!addingToCart[product.id]}
+                              className={`flex items-center space-x-1 px-3 py-2 rounded-md transition-colors ${addingToCart[product.id] ? 'bg-gray-400 cursor-not-allowed' : 'bg-primary text-white hover:bg-primary/90'}`}
+                            >
+                              {addingToCart[product.id] ? (
+                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />
+                              ) : (
+                                <ShoppingCart className="h-4 w-4" />
+                              )}
+                              <span className="text-sm">{addingToCart[product.id] ? 'Adding...' : 'Add'}</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
               ))}
